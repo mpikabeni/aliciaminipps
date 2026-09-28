@@ -2,6 +2,8 @@ import os, secrets
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Header
+import httpx
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, String, BigInteger, Integer, DateTime
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
@@ -9,6 +11,9 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./alicia_mini_apps.db")
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or 0)
 API_SECRET = os.getenv("API_SECRET", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*").strip()
+STARS_PLAN_LIMIT = int(os.getenv("STARS_PLAN_LIMIT", "10000"))
 engine = create_engine(DATABASE_URL, pool_pre_ping=True,
     connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -36,7 +41,14 @@ class Payment(Base):
     validated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 Base.metadata.create_all(engine)
-app = FastAPI(title="Alicia Mini Apps Backend", version="1.0.0")
+app = FastAPI(title="Alicia Mini Apps Backend", version="2.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if FRONTEND_ORIGIN == "*" else [FRONTEND_ORIGIN],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def db(): return SessionLocal()
 def admin(uid):
@@ -56,6 +68,17 @@ class PaymentIn(BaseModel):
 class ValidateIn(BaseModel):
     admin_user_id: int
     credits: int = Field(ge=0, le=10000000)
+
+@app.get("/plans")
+def plans():
+    return {
+        "currency": "XTR",
+        "plans": [
+            {"id": "starter", "stars": 100, "label": "100 ⭐"},
+            {"id": "standard", "stars": 500, "label": "500 ⭐"},
+            {"id": "pro", "stars": 1000, "label": "1000 ⭐"},
+        ],
+    }
 
 @app.get("/health")
 def health(): return {"status":"ok","service":"alicia-mini-apps"}
@@ -77,14 +100,58 @@ def get_user(telegram_id:int):
         return {"telegram_id":u.telegram_id,"credits":u.credits}
 
 @app.post("/payments/create")
-def create_payment(x:PaymentIn, x_api_secret:Optional[str]=Header(default=None)):
-    secret(x_api_secret)
-    payload=f"alicia_{x.telegram_id}_{secrets.token_urlsafe(16)}"
+async def create_payment(x: PaymentIn, x_api_secret: Optional[str] = Header(default=None)):
+    if not TELEGRAM_BOT_TOKEN:
+        raise HTTPException(503, "TELEGRAM_BOT_TOKEN is not configured")
+    if x.stars > STARS_PLAN_LIMIT:
+        raise HTTPException(400, "Stars amount exceeds configured limit")
+
+    payload = f"alicia_{x.telegram_id}_{secrets.token_urlsafe(16)}"
     with db() as s:
-        if not s.get(User,x.telegram_id): s.add(User(telegram_id=x.telegram_id))
-        p=Payment(telegram_id=x.telegram_id,stars=x.stars,payload=payload,status="pending")
-        s.add(p); s.commit(); s.refresh(p)
-        return {"payment_id":p.id,"payload":p.payload,"stars":p.stars,"status":p.status}
+        if not s.get(User, x.telegram_id):
+            s.add(User(telegram_id=x.telegram_id))
+        p = Payment(telegram_id=x.telegram_id, stars=x.stars, payload=payload, status="pending")
+        s.add(p)
+        s.commit()
+        s.refresh(p)
+        payment_id = p.id
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/createInvoiceLink"
+    body = {
+        "title": "Alicia Mini Apps",
+        "description": f"Abonnement Alicia Mini Apps — {x.stars} Stars",
+        "payload": payload,
+        "currency": "XTR",
+        "prices": [{"label": "Alicia Mini Apps", "amount": x.stars}],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(url, json=body)
+            response.raise_for_status()
+            data = response.json()
+    except Exception as exc:
+        with db() as s:
+            p = s.get(Payment, payment_id)
+            if p and p.status == "pending":
+                s.delete(p)
+                s.commit()
+        raise HTTPException(502, f"Telegram invoice error: {exc}")
+
+    if not data.get("ok") or not data.get("result"):
+        with db() as s:
+            p = s.get(Payment, payment_id)
+            if p and p.status == "pending":
+                s.delete(p)
+                s.commit()
+        raise HTTPException(502, data.get("description", "Telegram invoice creation failed"))
+
+    return {
+        "payment_id": payment_id,
+        "payload": payload,
+        "stars": x.stars,
+        "status": "pending",
+        "invoice_url": data["result"],
+    }
 
 @app.get("/payments/{payment_id}")
 def payment(payment_id:int,telegram_id:int):
